@@ -18,6 +18,9 @@
 | `results/lego_100` | 100×100 | 600 | 27,080 | **23.70 dB** | 22.6 min |
 | `results/lego_200` | 200×200 | 600（计划 1000，主动停在 checkpoint） | 35,746 | **22.77 dB** | ~25 min |
 | `results/human_200` | 200×200 | 500 | 20,328 | **39.05 dB** | 15.3 min |
+| `results/human_400` | **400×400** | 900（600 + 300 续训） | 35,388 | **42.06 dB** | ~35 min |
+| `results/human_800` | **800×800** | 1200（900→1200 续训） | 40,606 | **41.29 dB** | ~25 min（800 段） |
+| `results/human_1200` | **1200×1200** | 96（2 epoch，内存测试） | 41,746 | **39.90 dB** | 9.5 min |
 
 `results/*/renders/final_view*.png` 是「左 GT / 右 渲染」的并排图，`comparison.png` 是 4 个测试视角的拼图，
 `turntable.gif` 是绕物体 360° 的新视角旋转（CPU 渲出来的，可直接查看高斯体的 3D 一致性）。
@@ -26,6 +29,10 @@
 
 - lego 200×200：`results/lego_200/comparison.png`、`results/lego_200/turntable.gif`
 - 人体 200×200：`results/human_200/comparison.png`、`results/human_200/turntable.gif`
+- 人体 **400×400**：`results/human_400/comparison.png`、`results/human_400/turntable.gif`
+- 人体 **800×800**：`results/human_800/comparison.png`、`results/human_800/turntable.gif`
+- 人体 **1200×1200**（2 epoch 内存测试）：`results/human_1200/comparison.png`
+- 200 / 400 / 800 同区域清晰度对比：`results/sharpness_200_400_800.png`
 
 即使在这个很短的训练预算下，多视角图像也已经收敛成一个结构完整、可自由视角渲染的高斯体
 （`results/*/point_cloud.ply`，可直接用任意 3DGS 查看器打开，例如 https://superspl.at/editor）。
@@ -191,12 +198,72 @@ PYTHONPATH=$PWD/gsplat:$PWD/gsplat/examples .venv/bin/python examples/train_mps.
 > 人体模型（白色实验服）在纯白背景下会和背景融为一体，所以这里用灰色背景（`--bg 0.35`）渲染/合成。
 > 数据集是本地生成的，`data/` 已加入 `.gitignore`；只提交渲染脚本，模型文件不随仓库分发。
 
+## 4.5 高分辨率（400×400 / 800×800 / 1200×1200）
+
+数据集本身是 400×400 的；`--downscale 1` 即原生 400×400。400×400 的结果（42.06 dB）比 200×200
+（39.05 dB）高，而且细节明显更锐利（见 `results/sharpness_200_vs_400.png`）。
+
+> **默认档位策略（已确定）**：人体训练默认 **800×800**；需要极限细节时再上 **1200×1200**，
+> 且只做从 800 模型出发的 **1–2 epoch 短程精修**（48–96 步），不从头长跑。
+> 完整命令与理由见 [TRAINING_DEFAULTS.md](TRAINING_DEFAULTS.md)。
+
+```bash
+# 400×400，从 200×200 的 600 步 checkpoint 续训（工程上可以分段跑）
+PYTHONPATH=$PWD/gsplat:$PWD/gsplat/examples .venv/bin/python examples/train_mps.py \
+  --data_dir data/human --out_dir results/human_400 --downscale 1 \
+  --resume results/human_400/splats_step0600.pt --start_step 600 --steps 300 \
+  --eval_every 100 --save_every 100 --empty_cache_every 5 \
+  --refine_start 0 --refine_stop 900 --refine_every 100 --reset_every 1000000 \
+  --sh_degree_interval 100 --max_gaussians 150000 --grow_grad2d 1.5e-4 --bg 0.35
+```
+
+### 分辨率性能边界（M2 Pro 16GB，35k Gaussians）
+
+| 渲染分辨率 | 每步耗时（含反传） | driver 内存峰值 | 结论 |
+|---|---|---|---|
+| 400×400 | **1.3–2.1 s** | ~2.6 GB | 稳定，长跑只受磁盘/swap 轻微影响 |
+| **800×800（真实人体）** | **2.4–5.3 s** | **~5.1 GB** | **已实际训练到 1200 步（41.29 dB）** |
+| 800×800（随机重叠场景基准） | ~11.4 s | ~13.1 GB | 高斯重叠多时的最坏情况；不代表真实场景 |
+| 1200×1200（真实人体，第 1 步） | **~5–6 s** | **~9.6 GB** | 前几步与 8–10GB 的估计吻合 |
+| 1200×1200（真实人体，连续 96 步后） | 4–8 s | **~18.6 GB** | driver 随 MPSGraph 形状缓存持续增长，超出 16GB |
+
+### 1200×1200 实测（2 epoch）
+
+从 800 的 1200 步模型续训 96 步（2 个 epoch），实测：
+
+- 前 2 步：driver **9.61GB**、alloc 3.4GB、单步 5–6s —— 和“8–10GB”的估计基本一致；
+- 训练 96 步后：driver 从 11.7GB 一路涨到 **18.6GB**，期间 alloc 始终只有 **0.9GB**；
+- 全程 4–8s/step，96 步 9.5 分钟，测试 PSNR 39.90 dB（只做了 2 epoch 的适配，未收敛）；
+- 过程中 macOS swap/磁盘又被吃紧（磁盘最低到 ~4GB，退出后恢复）。
+
+关键结论：**1200×1200 的“活张量”很小（0.9GB），但 MPSGraph/Metal driver 会按每个新形状缓存
+编译后的 graph，随着每步 isects/pairs 数量变化持续增长**，最终超过 16GB。也就是说：
+
+- 1200×1200：1–2 个 epoch 可以跑，但长跑会严重 swap，不建议在 16GB 上直接跑完；
+- 800×800：真实数据峰值约 5.1GB driver，可分段长跑（每段 200–300 步）；
+- 400×400：最稳，适合完整训练。
+
+如果要在 16GB 上真正长跑 1200，有两条路：
+
+1. **分段训练（无需改代码，已验证可行）**：driver 缓存是 per-process 的，进程退出就释放。
+   每段跑 ~96 步（1–2 epoch），重启进程后用 `--resume splats.pt --start_step <global_step>`
+   接着跑。每段内存都从 ~9.6GB 重新开始涨，不会累积到把磁盘吃穿。代价是每段多 ~1–2 分钟
+   JIT/加载开销。
+2. **shape bucketing + activation checkpointing（改代码）**：把 isects/pairs 补齐到固定桶，
+   让 MPSGraph 复用已编译 graph；backward 分块重算。这是 M1/M2 的优化方向。
+
+内存曲线：`results/human_1200/memory_1200.png`。
+
+`--start_step` 用于 checkpoint 续训：它把学习率、SH 阶数、致密化/重置的全局 step 接上，
+避免续训时 SH 从 degree 0 重新爬坡。
+
 ## 5. 性能（M2 Pro, 16GB）
 
 | 配置 | 每步耗时 |
 |---|---|
 | 100×100, 20k→27k Gaussians | 0.7–3.5 s（致密化后变慢） |
 | 200×200, 20k→36k Gaussians | 1.5–4.5 s（见 `results/lego_200.log` / `human_200.log`） |
+| 400×400, 30k→35k Gaussians | 1.3–2.1 s（stable），致密化/续训时偶发 3–5 s（见 `human_400_resume.log`） |
 
 ### 关于 16GB 内存的工程注意
 
@@ -241,6 +308,8 @@ tools/render_human_dataset.py             # Blender 批量渲染人体多视角�
 tools/eval_checkpoint.py                  # 从 splats.pt 评估 / 导出 PLY（新增）
 tools/render_turntable.py                 # 环绕视角 GIF（新增）
 tools/make_comparison.py                  # GT|渲染 拼图（新增）
+results/sharpness_200_vs_400.png          # 200/400 清晰度对比
+results/sharpness_200_400_800.png         # 200/400/800 同区域对比
 run_train_lego.sh                         # 一键训练（新增）
 requirements-mps.txt                      # 依赖（新增）
 results/lego_100/                         # 100×100 训练结果

@@ -367,8 +367,11 @@ def main():
     ap.add_argument("--max_gaussians", type=int, default=150_000)
     ap.add_argument("--save_every", type=int, default=200)
     ap.add_argument("--empty_cache_every", type=int, default=20)
+    ap.add_argument("--log_memory_every", type=int, default=0)
     ap.add_argument("--resume", default=None,
                     help="optional splats.pt to warm-start from")
+    ap.add_argument("--start_step", type=int, default=0,
+                    help="global step offset when resuming from a checkpoint")
     ap.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -395,29 +398,30 @@ def main():
         f"{W}x{H} scene_scale={scene_scale:.3f} device={device}"
     )
 
-    init_pts, init_rgbs = None, None
-    if args.init == "hull":
-        init_pts, init_rgbs = visual_hull_init(
-            train["images"],
-            train["masks"],
-            train["c2ws"],
-            train["K"],
-            args.init_num_pts,
-            extent=args.init_extent,
-            min_hits=args.hull_min_hits,
-            seed=args.seed,
-        )
-        print(f"[init] visual hull: {init_pts.shape[0]} surface points")
-    params = build_splats(
-        args.init_num_pts, args.init_extent, args.sh_degree, device,
-        seed=args.seed, points=init_pts, rgbs=init_rgbs,
-    )
     if args.resume:
         ckpt = torch.load(args.resume, map_location="cpu")
-        for k, v in ckpt.items():
-            if k in params and params[k].shape == v.shape:
-                params[k].data.copy_(v.to(device))
+        params = torch.nn.ParameterDict(
+            {k: torch.nn.Parameter(v.float()) for k, v in ckpt.items()}
+        ).to(device)
         print(f"[resume] loaded {args.resume} ({params['means'].shape[0]} gaussians)")
+    else:
+        init_pts, init_rgbs = None, None
+        if args.init == "hull":
+            init_pts, init_rgbs = visual_hull_init(
+                train["images"],
+                train["masks"],
+                train["c2ws"],
+                train["K"],
+                args.init_num_pts,
+                extent=args.init_extent,
+                min_hits=args.hull_min_hits,
+                seed=args.seed,
+            )
+            print(f"[init] visual hull: {init_pts.shape[0]} surface points")
+        params = build_splats(
+            args.init_num_pts, args.init_extent, args.sh_degree, device,
+            seed=args.seed, points=init_pts, rgbs=init_rgbs,
+        )
     optimizers = make_optimizers(params, scene_scale)
     strategy = DefaultStrategy(
         absgrad=False,
@@ -445,9 +449,10 @@ def main():
     running = []
     for step in range(args.steps):
         idx = int(torch.randint(0, len(train_images), (1,)).item())
+        gstep = args.start_step + step
         gt = train_images[idx]
         viewmat = train_viewmats[idx : idx + 1]
-        sh_degree_to_use = min(step // args.sh_degree_interval, args.sh_degree)
+        sh_degree_to_use = min(gstep // args.sh_degree_interval, args.sh_degree)
 
         out, alpha, info = render_one(
             params, viewmat, train_K[None], W, H, sh_degree_to_use,
@@ -465,7 +470,7 @@ def main():
             raise RuntimeError(f"non-finite loss at step {step}")
 
         strategy.step_pre_backward(
-            params=params, optimizers=optimizers, state=strategy_state, step=step, info=info
+            params=params, optimizers=optimizers, state=strategy_state, step=gstep, info=info
         )
         loss.backward()
         for opt in optimizers.values():
@@ -476,9 +481,21 @@ def main():
                 params=params,
                 optimizers=optimizers,
                 state=strategy_state,
-                step=step,
+                step=gstep,
                 info=info,
                 packed=False,
+            )
+
+        if (
+            args.log_memory_every
+            and (gstep + 1) % args.log_memory_every == 0
+            and device == "mps"
+        ):
+            print(
+                f"  [mem] step {gstep + 1}: driver="
+                f"{torch.mps.driver_allocated_memory() / 1e9:.2f}GB "
+                f"alloc={torch.mps.current_allocated_memory() / 1e9:.2f}GB",
+                flush=True,
             )
 
         if (step + 1) % args.empty_cache_every == 0 and device == "mps":
@@ -488,27 +505,27 @@ def main():
         if (step + 1) % 10 == 0:
             dt = time.time() - t0
             print(
-                f"step {step + 1:4d}/{args.steps} loss={np.mean(running[-10:]):.4f} "
+                f"step {gstep + 1:4d}/{args.start_step + args.steps} loss={np.mean(running[-10:]):.4f} "
                 f"gs={params['means'].shape[0]} {dt / 10:.2f}s/it",
                 flush=True,
             )
             t0 = time.time()
 
-        if args.save_every and (step + 1) % args.save_every == 0:
+        if args.save_every and (gstep + 1) % args.save_every == 0:
             sd = {k: v.detach().cpu() for k, v in params.items()}
             torch.save(sd, out_dir / "splats.pt")
-            torch.save(sd, out_dir / f"splats_step{step + 1:04d}.pt")
+            torch.save(sd, out_dir / f"splats_step{gstep + 1:04d}.pt")
 
-        if (step + 1) % args.eval_every == 0 or step == args.steps - 1:
+        if (gstep + 1) % args.eval_every == 0 or step == args.steps - 1:
             p, _ = evaluate(
                 params, test, device, args.sh_degree,
-                save_prefix=str(out_dir / "renders" / f"step{step + 1:04d}"),
+                save_prefix=str(out_dir / "renders" / f"step{gstep + 1:04d}"),
                 args_bg=args.bg,
             )
-            print(f"  [eval] step {step + 1}: test PSNR={p:.2f} dB", flush=True)
+            print(f"  [eval] step {gstep + 1}: test PSNR={p:.2f} dB", flush=True)
             with open(csv_path, "a", newline="") as f:
                 csv.writer(f).writerow(
-                    [step + 1, float(np.mean(running[-10:])), l1.detach().item(),
+                    [gstep + 1, float(np.mean(running[-10:])), l1.detach().item(),
                      float(ssim_val.detach()), int(params["means"].shape[0]), p,
                      time.time() - t_start]
                 )
