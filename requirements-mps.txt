@@ -1,0 +1,5 @@
+# Apple Silicon (MPS) training requirements for gsplat's pure-PyTorch path.
+# No CUDA toolkit, no gsplat C++/CUDA extension, no nerfacc.
+torch>=2.4          # tested with 2.8.0 (MPS backend)
+numpy
+pillow
